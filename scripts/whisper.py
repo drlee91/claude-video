@@ -24,12 +24,19 @@ import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from deepgram_backend import load_deepgram_key, transcribe_deepgram
+
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3"
 
 OPENAI_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 OPENAI_MODEL = "whisper-1"
+
+# Groq and OpenAI both reject uploads larger than 25 MB (HTTP 413). Above this
+# threshold we route straight to Deepgram (no practical size limit) when a key
+# is configured. 24 MB leaves headroom under the hard 25 MB cap.
+WHISPER_MAX_MB = 24.0
 
 
 def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
@@ -266,47 +273,103 @@ def transcribe_video(
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
+    deepgram_key: str | None = None,
 ) -> tuple[list[dict], str]:
     """Run the full flow: extract audio → upload → parse segments.
 
-    Returns (segments, backend_used). Raises SystemExit on any failure.
+    Routing:
+      - backend == "deepgram": Deepgram only, regardless of audio size or
+        other configured keys.
+      - Audio <= 24 MB: try Whisper (Groq/OpenAI); on failure fall back to
+        Deepgram if a key is available. With no Whisper key, Deepgram is the
+        primary backend.
+      - Audio > 24 MB: route straight to Deepgram (Whisper would 413). With no
+        Deepgram key, attempt Whisper anyway so the user gets a clear error.
+
+    Returns (segments, backend_used) where backend_used is "groq", "openai",
+    or "deepgram". Raises SystemExit if every available backend fails.
     """
-    if backend is None or api_key is None:
+    if deepgram_key is None:
+        deepgram_key = load_deepgram_key()
+
+    if backend == "deepgram":
+        if not deepgram_key:
+            raise SystemExit(
+                "Deepgram backend requested but no DEEPGRAM_API_KEY is configured. "
+                "Set it in the environment or in ~/.config/watch/.env."
+            )
+        backend, api_key = None, None  # skip the Whisper path entirely
+    elif backend is None or api_key is None:
         detected_backend, detected_key = load_api_key()
         backend = backend or detected_backend
         api_key = api_key or detected_key
 
-    if not backend or not api_key:
+    have_whisper = bool(backend and api_key)
+    if not have_whisper and not deepgram_key:
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
-            "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
-            "in the environment or in ~/.config/watch/.env. "
+            "No transcription API key available. Set GROQ_API_KEY (preferred) or "
+            "OPENAI_API_KEY for Whisper, or DEEPGRAM_API_KEY for large files, in the "
+            "environment or in ~/.config/watch/.env. "
             f"Run `python3 {setup_py}` to configure."
         )
 
-    print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
+    print("[watch] extracting audio for transcription…", file=sys.stderr)
     audio_path = extract_audio(video_path, audio_out)
-    size_kb = audio_path.stat().st_size / 1024
-    print(f"[watch] audio: {size_kb:.0f} kB — uploading to {backend} Whisper…", file=sys.stderr)
+    size_mb = audio_path.stat().st_size / (1024 * 1024)
+    print(f"[watch] audio: {size_mb:.1f} MB", file=sys.stderr)
 
-    if backend == "groq":
-        response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
-    elif backend == "openai":
-        response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
-    else:
-        raise SystemExit(f"Unknown whisper backend: {backend}")
+    too_big_for_whisper = size_mb > WHISPER_MAX_MB
+    errors: list[str] = []
 
-    segments = _segments_from_response(response)
-    if not segments:
-        raise SystemExit("Whisper returned no transcript segments")
+    # Whisper first, unless the file is too big AND Deepgram can take it instead.
+    if have_whisper and not (too_big_for_whisper and deepgram_key):
+        if too_big_for_whisper:
+            print(
+                f"[watch] audio is {size_mb:.1f} MB (> 25 MB Whisper limit) and no "
+                f"Deepgram key set — attempting {backend} anyway…",
+                file=sys.stderr,
+            )
+        try:
+            if backend == "groq":
+                response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
+            elif backend == "openai":
+                response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
+            else:
+                raise SystemExit(f"Unknown whisper backend: {backend}")
+            segments = _segments_from_response(response)
+            if segments:
+                print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
+                return segments, backend
+            errors.append(f"{backend}: returned no segments")
+        except SystemExit as exc:
+            errors.append(f"{backend}: {exc}")
+            if not deepgram_key:
+                raise
+            print(f"[watch] {backend} Whisper failed — falling back to Deepgram", file=sys.stderr)
+    elif have_whisper and too_big_for_whisper and deepgram_key:
+        print(
+            f"[watch] audio is {size_mb:.1f} MB — over Whisper's 25 MB limit; "
+            "routing to Deepgram",
+            file=sys.stderr,
+        )
 
-    print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
-    return segments, backend
+    # Deepgram fallback (or primary, when it's the only key configured).
+    if deepgram_key:
+        print("[watch] uploading to Deepgram (nova-2)…", file=sys.stderr)
+        try:
+            segments = transcribe_deepgram(audio_path, deepgram_key)
+            print(f"[watch] transcribed {len(segments)} segments via deepgram", file=sys.stderr)
+            return segments, "deepgram"
+        except SystemExit as exc:
+            errors.append(f"deepgram: {exc}")
+
+    raise SystemExit("transcription failed — " + "; ".join(errors))
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
+        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai|deepgram]", file=sys.stderr)
         raise SystemExit(2)
 
     video = sys.argv[1]

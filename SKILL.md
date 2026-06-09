@@ -81,7 +81,7 @@ Optional flags:
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
-- `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
+- `--whisper groq|openai|deepgram` — force a specific transcription backend (default: prefer Groq if multiple keys exist; Deepgram auto-handles audio over 25 MB)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
 
 ### Focusing on a section (higher frame rate)
@@ -125,14 +125,16 @@ If the user asked a specific question, answer it directly citing timestamps. If 
 
 ## Transcription
 
-The script gets a timestamped transcript in one of two ways:
+The script gets a timestamped transcript in one of three ways:
 
 1. **Native captions (free, preferred).** yt-dlp pulls manual or auto-generated subtitles from the source platform if available.
 2. **Whisper API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever Whisper API has a key configured:
    - **Groq** — `whisper-large-v3`. Preferred default: cheaper, faster. Get a key at console.groq.com/keys.
    - **OpenAI** — `whisper-1`. Fallback. Get a key at platform.openai.com/api-keys.
+   - **Size limit:** Groq and OpenAI both reject uploads over **25 MB** (HTTP 413) — roughly **45+ minutes** of audio at 64 kbps. Past that, Whisper can't be used.
+3. **Deepgram.** Routes to Deepgram's pre-recorded API (`nova-2`, `utterances=true`, `detect_language=true`), which has no practical size limit (~2 GB). Used automatically when the extracted audio exceeds ~24 MB or when Whisper fails — and works **standalone** as the primary backend when `DEEPGRAM_API_KEY` is the only key configured. Get a key at console.deepgram.com.
 
-Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are set; override with `--whisper openai` to force OpenAI. Use `--no-whisper` to skip the fallback entirely.
+All keys live in `~/.config/watch/.env`. The script prefers Groq when set; override with `--whisper openai` or `--whisper deepgram` to force a backend. Audio over 24 MB auto-routes to Deepgram if a `DEEPGRAM_API_KEY` is present, so long videos transcribe end-to-end. Use `--no-whisper` to skip the audio-transcription fallback entirely (captions only).
 
 ## Failure modes and handling
 
@@ -140,7 +142,7 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
-- **Whisper request fails** → the error is printed to stderr (likely: invalid key, rate limit, or 25 MB upload limit on a very long video). The report will say "none available" for transcript. You can retry with `--whisper openai` if Groq failed (or vice versa).
+- **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit; audio over 25 MB auto-routes to Deepgram when a key is set). The report will say "none available" for transcript. You can retry with `--whisper openai` if Groq failed (or vice versa), or `--whisper deepgram` to bypass Whisper entirely.
 
 ## Token efficiency
 
@@ -158,6 +160,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
+- Sends the extracted audio clip to Deepgram's pre-recorded API (`api.deepgram.com/v1/listen`) when `DEEPGRAM_API_KEY` is set and the audio is too large for Whisper's 25 MB limit (or Whisper otherwise failed)
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 

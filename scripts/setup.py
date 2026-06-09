@@ -41,11 +41,16 @@ ENV_TEMPLATE = """# /watch API configuration
 # Get a Groq key:  https://console.groq.com/keys
 # Get an OpenAI key:  https://platform.openai.com/api-keys
 #
-# Leave both blank to disable Whisper — /watch will still work, but videos
-# without native captions will come back frames-only.
+# Deepgram is optional: it handles audio over Whisper's 25 MB upload limit
+# (videos longer than ~45 minutes) and also works standalone as the only key.
+# Get a Deepgram key:  https://console.deepgram.com
+#
+# Leave all blank to disable transcription — /watch will still work, but
+# videos without native captions will come back frames-only.
 
 GROQ_API_KEY=
 OPENAI_API_KEY=
+DEEPGRAM_API_KEY=
 """
 
 
@@ -100,6 +105,8 @@ def _have_api_key() -> tuple[bool, str | None]:
         return True, "groq"
     if _read_env_key("OPENAI_API_KEY"):
         return True, "openai"
+    if _read_env_key("DEEPGRAM_API_KEY"):
+        return True, "deepgram"
     return False, None
 
 
@@ -238,7 +245,7 @@ def cmd_check() -> int:
     if s["missing_binaries"]:
         parts.append(f"missing binaries: {', '.join(s['missing_binaries'])}")
     if not s["has_api_key"]:
-        parts.append("no Whisper API key (GROQ_API_KEY or OPENAI_API_KEY)")
+        parts.append("no transcription API key (GROQ_API_KEY, OPENAI_API_KEY, or DEEPGRAM_API_KEY)")
     installer = Path(__file__).resolve()
     sys.stderr.write(
         f"[watch] setup incomplete ({'; '.join(parts)}). "
@@ -302,11 +309,12 @@ def cmd_install() -> int:
         return 0
 
     print("")
-    print("[setup] one step left: add a Whisper API key.")
+    print("[setup] one step left: add a transcription API key.")
     print("")
-    print(f"  Edit {CONFIG_FILE} and set either:")
-    print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
-    print("    OPENAI_API_KEY=...  (fallback; get one at platform.openai.com/api-keys)")
+    print(f"  Edit {CONFIG_FILE} and set one of:")
+    print("    GROQ_API_KEY=...      (preferred — cheaper, faster; get one at console.groq.com/keys)")
+    print("    OPENAI_API_KEY=...    (fallback; get one at platform.openai.com/api-keys)")
+    print("    DEEPGRAM_API_KEY=...  (handles audio over Whisper's 25 MB limit; console.deepgram.com)")
     print("")
     print("  Without a key, /watch still works but videos without captions come back frames-only.")
     return 3
