@@ -46,10 +46,13 @@ def _pick_subtitle(out_dir: Path, lang: str | None = None) -> Path | None:
     if not candidates:
         return None
     for code in _sub_lang_candidates(lang):
-        preferred = [c for c in candidates if f".{code}" in c.name]
+        preferred = [c for c in candidates if f".{code}." in c.name]
         if preferred:
             return preferred[0]
-    preferred = [c for c in candidates if ".en" in c.name]
+    preferred = [
+        c for c in candidates
+        if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB.", ".en-orig."))
+    ]
     return preferred[0] if preferred else candidates[0]
 
 
@@ -71,13 +74,13 @@ def _probe_language(url: str) -> str | None:
 
 
 def _sub_lang_candidates(lang: str | None) -> list[str]:
-    """Ordered, deduped --sub-langs candidates for a detected/explicit language code.
+    """Ordered, deduped language codes to request/prefer for subtitles.
 
-    Includes the primary subtag (e.g. "en" for "en-US") because YouTube's
-    caption tracks are keyed by primary subtag, not full locale.
+    Includes the primary subtag (e.g. "en" for "en-US") because YouTube keys
+    caption tracks by primary subtag, not full locale.
     """
     if not lang:
-        return ["en"]
+        return []
     primary = lang.split("-")[0]
     codes: list[str] = []
     for code in (lang, primary):
@@ -86,8 +89,20 @@ def _sub_lang_candidates(lang: str | None) -> list[str]:
     return codes
 
 
+def _sub_langs_arg(lang: str | None) -> str:
+    """Build the --sub-langs value: the video's own language, English as fallback.
+
+    Never "all" — that makes yt-dlp enumerate YouTube's hundreds of
+    auto-translated tracks and stalls the run before the download starts.
+    """
+    codes = _sub_lang_candidates(lang)
+    if not codes:
+        return "en.*"
+    return ",".join(codes + ["en.*"])
+
+
 def _pick_video(out_dir: Path) -> Path | None:
-    for ext in (".mp4", ".mkv", ".webm", ".mov"):
+    for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".opus"):
         for candidate in out_dir.glob(f"video*{ext}"):
             return candidate
     for candidate in out_dir.glob("video.*"):
@@ -96,25 +111,82 @@ def _pick_video(out_dir: Path) -> Path | None:
     return None
 
 
-def download_url(url: str, out_dir: Path, lang: str | None = None) -> dict:
+def fetch_captions(url: str, out_dir: Path, lang: str | None = None) -> dict:
+    """Fetch metadata and best available VTT captions without downloading video."""
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
 
     detected_lang = lang or _probe_language(url)
-    sub_langs = ",".join(_sub_lang_candidates(detected_lang))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(out_dir / "video.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--write-info-json",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs", _sub_langs_arg(detected_lang),
+        "--sub-format", "vtt",
+        "--convert-subs", "vtt",
+        "--no-playlist",
+        "--ignore-errors",
+        "-o", output_template,
+        "--",
+        url,
+    ]
+    subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    subtitle = _pick_subtitle(out_dir, detected_lang)
+    info = _read_info(out_dir / "video.info.json", url)
+    return {
+        "video_path": None,
+        "subtitle_path": str(subtitle) if subtitle else None,
+        "info": info or {"url": url},
+        "downloaded": False,
+    }
+
+
+def _read_info(info_path: Path, url: str) -> dict:
+    info: dict = {}
+    if info_path.exists():
+        try:
+            raw = json.loads(info_path.read_text(encoding="utf-8"))
+            info = {
+                "title": raw.get("title"),
+                "uploader": raw.get("uploader") or raw.get("channel"),
+                "duration": raw.get("duration"),
+                "url": raw.get("webpage_url") or url,
+            }
+        except Exception as exc:
+            print(f"[watch] info.json parse failed: {exc}", file=sys.stderr)
+            info = {"url": url}
+    return info
+
+
+def download_url(
+    url: str,
+    out_dir: Path,
+    audio_only: bool = False,
+    lang: str | None = None,
+) -> dict:
+    if shutil.which("yt-dlp") is None:
+        raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
+
+    detected_lang = lang or _probe_language(url)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
 
+    fmt = "ba/bestaudio" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
     cmd = [
         "yt-dlp",
         "-N", "8",
-        "-f", "bv*[height<=720]+ba/b[height<=720]/bv+ba/b",
+        "-f", fmt,
         "--merge-output-format", "mp4",
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", sub_langs,
+        "--sub-langs", _sub_langs_arg(detected_lang),
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
@@ -134,20 +206,7 @@ def download_url(url: str, out_dir: Path, lang: str | None = None) -> dict:
         )
 
     subtitle = _pick_subtitle(out_dir, detected_lang)
-    info_path = out_dir / "video.info.json"
-    info: dict = {}
-    if info_path.exists():
-        try:
-            raw = json.loads(info_path.read_text(encoding="utf-8"))
-            info = {
-                "title": raw.get("title"),
-                "uploader": raw.get("uploader") or raw.get("channel"),
-                "duration": raw.get("duration"),
-                "url": raw.get("webpage_url") or url,
-            }
-        except Exception as exc:
-            print(f"[watch] info.json parse failed: {exc}", file=sys.stderr)
-            info = {"url": url}
+    info = _read_info(out_dir / "video.info.json", url)
 
     return {
         "video_path": str(video),
@@ -157,9 +216,14 @@ def download_url(url: str, out_dir: Path, lang: str | None = None) -> dict:
     }
 
 
-def download(source: str, out_dir: Path, lang: str | None = None) -> dict:
+def download(
+    source: str,
+    out_dir: Path,
+    audio_only: bool = False,
+    lang: str | None = None,
+) -> dict:
     if is_url(source):
-        return download_url(source, out_dir, lang=lang)
+        return download_url(source, out_dir, audio_only=audio_only, lang=lang)
     return resolve_local(source)
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import mimetypes
 import os
 import shutil
@@ -24,8 +25,6 @@ import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from deepgram_backend import load_deepgram_key, transcribe_deepgram
-
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3"
@@ -33,10 +32,34 @@ GROQ_MODEL = "whisper-large-v3"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 OPENAI_MODEL = "whisper-1"
 
-# Groq and OpenAI both reject uploads larger than 25 MB (HTTP 413). Above this
-# threshold we route straight to Deepgram (no practical size limit) when a key
-# is configured. 24 MB leaves headroom under the hard 25 MB cap.
-WHISPER_MAX_MB = 24.0
+# Both Groq's free tier and OpenAI whisper-1 cap uploads at 25 MB. We target a
+# margin under that so multipart framing overhead never pushes a chunk over.
+MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+
+
+def plan_chunks(
+    total_seconds: float,
+    total_bytes: int,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+) -> list[tuple[float, float]]:
+    """Split a duration into contiguous (offset, duration) chunks under max_bytes.
+
+    Size scales linearly with duration (constant-bitrate mono mp3), so an even
+    time split yields evenly-sized chunks. Returns a single full-length chunk
+    when the audio already fits.
+    """
+    if total_bytes <= max_bytes or total_seconds <= 0:
+        return [(0.0, total_seconds)]
+
+    n = math.ceil(total_bytes / max_bytes)
+    chunk = total_seconds / n
+    plan: list[tuple[float, float]] = []
+    for i in range(n):
+        offset = i * chunk
+        # The last chunk absorbs any rounding remainder so durations sum exactly.
+        duration = (total_seconds - offset) if i == n - 1 else chunk
+        plan.append((round(offset, 3), round(duration, 3)))
+    return plan
 
 
 def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
@@ -114,6 +137,65 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
     if not out_path.exists() or out_path.stat().st_size == 0:
         raise SystemExit("ffmpeg produced no audio — video may have no audio track")
     return out_path
+
+
+def audio_duration(audio_path: Path) -> float:
+    """Return the duration of an audio file in seconds via ffprobe."""
+    if shutil.which("ffprobe") is None:
+        raise SystemExit("ffprobe is not installed. Install with: brew install ffmpeg")
+
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            str(audio_path.resolve()),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"ffprobe failed: {result.stderr.strip()}")
+    fmt = json.loads(result.stdout or "{}").get("format", {})
+    return float(fmt.get("duration") or 0.0)
+
+
+def split_audio(
+    full_audio: Path,
+    work_dir: Path,
+    plan: list[tuple[float, float]],
+) -> list[tuple[Path, float]]:
+    """Slice full_audio into per-plan chunk files, returning (path, offset) pairs.
+
+    Uses stream copy (`-c copy`) so there is no re-encode and no quality loss;
+    mp3 frame boundaries are close enough for transcription's purposes.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    chunks: list[tuple[Path, float]] = []
+    for index, (offset, duration) in enumerate(plan):
+        out_path = work_dir / f"chunk_{index:03d}.mp3"
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-ss", f"{offset:.3f}",
+            "-i", str(full_audio.resolve()),
+            "-t", f"{duration:.3f}",
+            "-c", "copy",
+            str(out_path.resolve()),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+            raise SystemExit(
+                f"ffmpeg failed to split audio chunk {index + 1}: {result.stderr.strip()}"
+            )
+        chunks.append((out_path, offset))
+    return chunks
 
 
 def _build_multipart(fields: dict[str, str], file_path: Path) -> tuple[bytes, str]:
@@ -247,6 +329,24 @@ def _retry_after(exc: urllib.error.HTTPError) -> float | None:
         return None
 
 
+def shift_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
+    """Return a copy of segments with start/end shifted by offset_seconds.
+
+    Each chunk is transcribed in isolation, so Whisper returns 0-based timestamps
+    per chunk; shifting by the chunk's offset stitches them into source time.
+    """
+    if offset_seconds == 0:
+        return segments
+    return [
+        {
+            "start": round(seg["start"] + offset_seconds, 2),
+            "end": round(seg["end"] + offset_seconds, 2),
+            "text": seg["text"],
+        }
+        for seg in segments
+    ]
+
+
 def _segments_from_response(data: dict) -> list[dict]:
     """Convert Whisper verbose_json into our {start, end, text} segment format."""
     out: list[dict] = []
@@ -268,108 +368,106 @@ def _segments_from_response(data: dict) -> list[dict]:
     return out
 
 
+def transcribe_chunks(
+    chunks: list[tuple[Path, float]],
+    transcribe_one,
+) -> list[dict]:
+    """Transcribe each chunk, shift its segments by the chunk offset, concatenate.
+
+    A chunk that fails after its own retries is logged and skipped so one bad
+    slice doesn't discard the whole transcript. Raises only if every chunk fails.
+    """
+    segments: list[dict] = []
+    failures = 0
+    for index, (path, offset) in enumerate(chunks):
+        try:
+            chunk_segments = transcribe_one(path)
+        except SystemExit as exc:
+            failures += 1
+            print(
+                f"[watch] chunk {index + 1}/{len(chunks)} failed — skipping ({exc})",
+                file=sys.stderr,
+            )
+            continue
+        segments.extend(shift_segments(chunk_segments, offset))
+        print(
+            f"[watch] chunk {index + 1}/{len(chunks)} → {len(chunk_segments)} segments",
+            file=sys.stderr,
+        )
+
+    if failures == len(chunks):
+        raise SystemExit("Whisper failed on every audio chunk")
+    return segments
+
+
+def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]:
+    """Upload one audio file and return its 0-based segments."""
+    if backend == "groq":
+        response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
+    elif backend == "openai":
+        response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
+    else:
+        raise SystemExit(f"Unknown whisper backend: {backend}")
+    return _segments_from_response(response)
+
+
 def transcribe_video(
     video_path: str,
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
-    deepgram_key: str | None = None,
 ) -> tuple[list[dict], str]:
     """Run the full flow: extract audio → upload → parse segments.
 
-    Routing:
-      - backend == "deepgram": Deepgram only, regardless of audio size or
-        other configured keys.
-      - Audio <= 24 MB: try Whisper (Groq/OpenAI); on failure fall back to
-        Deepgram if a key is available. With no Whisper key, Deepgram is the
-        primary backend.
-      - Audio > 24 MB: route straight to Deepgram (Whisper would 413). With no
-        Deepgram key, attempt Whisper anyway so the user gets a clear error.
-
-    Returns (segments, backend_used) where backend_used is "groq", "openai",
-    or "deepgram". Raises SystemExit if every available backend fails.
+    Returns (segments, backend_used). Raises SystemExit on any failure.
     """
-    if deepgram_key is None:
-        deepgram_key = load_deepgram_key()
-
-    if backend == "deepgram":
-        if not deepgram_key:
-            raise SystemExit(
-                "Deepgram backend requested but no DEEPGRAM_API_KEY is configured. "
-                "Set it in the environment or in ~/.config/watch/.env."
-            )
-        backend, api_key = None, None  # skip the Whisper path entirely
-    elif backend is None or api_key is None:
+    if backend is None or api_key is None:
         detected_backend, detected_key = load_api_key()
         backend = backend or detected_backend
         api_key = api_key or detected_key
 
-    have_whisper = bool(backend and api_key)
-    if not have_whisper and not deepgram_key:
+    if not backend or not api_key:
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
-            "No transcription API key available. Set GROQ_API_KEY (preferred) or "
-            "OPENAI_API_KEY for Whisper, or DEEPGRAM_API_KEY for large files, in the "
-            "environment or in ~/.config/watch/.env. "
+            "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
+            "in the environment or in ~/.config/watch/.env. "
             f"Run `python3 {setup_py}` to configure."
         )
 
-    print("[watch] extracting audio for transcription…", file=sys.stderr)
+    print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
     audio_path = extract_audio(video_path, audio_out)
-    size_mb = audio_path.stat().st_size / (1024 * 1024)
-    print(f"[watch] audio: {size_mb:.1f} MB", file=sys.stderr)
+    audio_bytes = audio_path.stat().st_size
 
-    too_big_for_whisper = size_mb > WHISPER_MAX_MB
-    errors: list[str] = []
+    def transcribe_one(path: Path) -> list[dict]:
+        return _transcribe_file(backend, api_key, path)
 
-    # Whisper first, unless the file is too big AND Deepgram can take it instead.
-    if have_whisper and not (too_big_for_whisper and deepgram_key):
-        if too_big_for_whisper:
-            print(
-                f"[watch] audio is {size_mb:.1f} MB (> 25 MB Whisper limit) and no "
-                f"Deepgram key set — attempting {backend} anyway…",
-                file=sys.stderr,
-            )
-        try:
-            if backend == "groq":
-                response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
-            elif backend == "openai":
-                response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
-            else:
-                raise SystemExit(f"Unknown whisper backend: {backend}")
-            segments = _segments_from_response(response)
-            if segments:
-                print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
-                return segments, backend
-            errors.append(f"{backend}: returned no segments")
-        except SystemExit as exc:
-            errors.append(f"{backend}: {exc}")
-            if not deepgram_key:
-                raise
-            print(f"[watch] {backend} Whisper failed — falling back to Deepgram", file=sys.stderr)
-    elif have_whisper and too_big_for_whisper and deepgram_key:
+    if audio_bytes <= MAX_UPLOAD_BYTES:
         print(
-            f"[watch] audio is {size_mb:.1f} MB — over Whisper's 25 MB limit; "
-            "routing to Deepgram",
+            f"[watch] audio: {audio_bytes / 1024:.0f} kB — uploading to {backend} Whisper…",
             file=sys.stderr,
         )
+        segments = transcribe_one(audio_path)
+    else:
+        duration = audio_duration(audio_path)
+        plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES)
+        print(
+            f"[watch] audio: {audio_bytes / (1024 * 1024):.0f} MB exceeds "
+            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB — splitting into {len(plan)} chunks…",
+            file=sys.stderr,
+        )
+        chunks = split_audio(audio_path, audio_out.parent / "chunks", plan)
+        segments = transcribe_chunks(chunks, transcribe_one)
 
-    # Deepgram fallback (or primary, when it's the only key configured).
-    if deepgram_key:
-        print("[watch] uploading to Deepgram (nova-2)…", file=sys.stderr)
-        try:
-            segments = transcribe_deepgram(audio_path, deepgram_key)
-            print(f"[watch] transcribed {len(segments)} segments via deepgram", file=sys.stderr)
-            return segments, "deepgram"
-        except SystemExit as exc:
-            errors.append(f"deepgram: {exc}")
+    if not segments:
+        raise SystemExit("Whisper returned no transcript segments")
 
-    raise SystemExit("transcription failed — " + "; ".join(errors))
+    print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
+    return segments, backend
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai|deepgram]", file=sys.stderr)
+        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
         raise SystemExit(2)
 
     video = sys.argv[1]
