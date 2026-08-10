@@ -30,6 +30,7 @@ from download import download, is_url  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract, format_time, get_metadata, parse_time  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
+from deepgram_backend import load_deepgram_key  # noqa: E402
 
 
 def main() -> int:
@@ -51,9 +52,12 @@ def main() -> int:
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["groq", "openai", "deepgram"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help=(
+            "Force a specific transcription backend. Default: prefer Groq, fall back "
+            "to OpenAI; Deepgram is used for audio over 25 MB or when it holds the only key."
+        ),
     )
     args = ap.parse_args()
 
@@ -128,29 +132,37 @@ def main() -> int:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
     if not transcript_segments and not args.no_whisper:
-        backend, api_key = load_api_key(args.whisper)
-        if backend and api_key:
+        deepgram_key = load_deepgram_key()
+        if args.whisper == "deepgram":
+            # Forced Deepgram: skip Whisper key detection entirely.
+            backend, api_key = ("deepgram", None) if deepgram_key else (None, None)
+        else:
+            backend, api_key = load_api_key(args.whisper)
+        if (backend and api_key) or deepgram_key:
             try:
                 all_segments, used_backend = transcribe_video(
                     video_path,
                     work / "audio.mp3",
                     backend=backend,
                     api_key=api_key,
+                    deepgram_key=deepgram_key,
                 )
                 transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 transcript_text = format_transcript(transcript_segments)
-                transcript_source = f"whisper ({used_backend})"
+                transcript_source = (
+                    "deepgram" if used_backend == "deepgram" else f"whisper ({used_backend})"
+                )
             except SystemExit as exc:
-                print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
+                print(f"[watch] transcription fallback failed: {exc}", file=sys.stderr)
         else:
             hint = (
                 f"--whisper {args.whisper} was set but the matching API key is missing"
                 if args.whisper else
-                "no subtitles and no Whisper API key found"
+                "no subtitles and no transcription API key found"
             )
             setup_py = SCRIPT_DIR / "setup.py"
             print(
-                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
+                f"[watch] {hint} — run `python3 {setup_py}` to enable the transcript fallback",
                 file=sys.stderr,
             )
 
