@@ -77,6 +77,12 @@ def main() -> int:
         help="Disable near-duplicate frame removal. Keeps visually identical "
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
+    ap.add_argument(
+        "--lang",
+        type=str,
+        default=None,
+        help="Force subtitle language (e.g. 'de'). Default: auto-detect from video metadata.",
+    )
     args = ap.parse_args()
 
     config = get_config()
@@ -107,7 +113,7 @@ def main() -> int:
 
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
-        dl = fetch_captions(args.source, work / "download")
+        dl = fetch_captions(args.source, work / "download", lang=args.lang)
         if dl.get("subtitle_path"):
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
@@ -133,6 +139,7 @@ def main() -> int:
                 args.source,
                 work / "download",
                 audio_only=audio_only,
+                lang=args.lang,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)

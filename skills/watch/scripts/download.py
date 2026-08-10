@@ -41,15 +41,64 @@ def resolve_local(path: str) -> dict:
     }
 
 
-def _pick_subtitle(out_dir: Path) -> Path | None:
+def _pick_subtitle(out_dir: Path, lang: str | None = None) -> Path | None:
     candidates = sorted(out_dir.glob("video*.vtt"))
     if not candidates:
         return None
+    for code in _sub_lang_candidates(lang):
+        preferred = [c for c in candidates if f".{code}." in c.name]
+        if preferred:
+            return preferred[0]
     preferred = [
         c for c in candidates
         if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB.", ".en-orig."))
     ]
     return preferred[0] if preferred else candidates[0]
+
+
+def _probe_language(url: str) -> str | None:
+    """Best-effort detection of the video's original spoken language via yt-dlp metadata."""
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--skip-download", "--print", "%(language)s", "--", url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    lang = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
+    if not lang or lang.upper() == "NA":
+        return None
+    return lang
+
+
+def _sub_lang_candidates(lang: str | None) -> list[str]:
+    """Ordered, deduped language codes to request/prefer for subtitles.
+
+    Includes the primary subtag (e.g. "en" for "en-US") because YouTube keys
+    caption tracks by primary subtag, not full locale.
+    """
+    if not lang:
+        return []
+    primary = lang.split("-")[0]
+    codes: list[str] = []
+    for code in (lang, primary):
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _sub_langs_arg(lang: str | None) -> str:
+    """Build the --sub-langs value: the video's own language, English as fallback.
+
+    Never "all" — that makes yt-dlp enumerate YouTube's hundreds of
+    auto-translated tracks and stalls the run before the download starts.
+    """
+    codes = _sub_lang_candidates(lang)
+    if not codes:
+        return "en.*"
+    return ",".join(codes + ["en.*"])
 
 
 def _pick_video(out_dir: Path) -> Path | None:
@@ -62,10 +111,12 @@ def _pick_video(out_dir: Path) -> Path | None:
     return None
 
 
-def fetch_captions(url: str, out_dir: Path) -> dict:
+def fetch_captions(url: str, out_dir: Path, lang: str | None = None) -> dict:
     """Fetch metadata and best available VTT captions without downloading video."""
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
+
+    detected_lang = lang or _probe_language(url)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
@@ -75,7 +126,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*",
+        "--sub-langs", _sub_langs_arg(detected_lang),
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
@@ -85,7 +136,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         url,
     ]
     subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
-    subtitle = _pick_subtitle(out_dir)
+    subtitle = _pick_subtitle(out_dir, detected_lang)
     info = _read_info(out_dir / "video.info.json", url)
     return {
         "video_path": None,
@@ -116,9 +167,12 @@ def download_url(
     url: str,
     out_dir: Path,
     audio_only: bool = False,
+    lang: str | None = None,
 ) -> dict:
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
+
+    detected_lang = lang or _probe_language(url)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
@@ -132,7 +186,7 @@ def download_url(
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*",
+        "--sub-langs", _sub_langs_arg(detected_lang),
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
@@ -151,7 +205,7 @@ def download_url(
             f"yt-dlp did not produce a video file in {out_dir} (exit {result.returncode})"
         )
 
-    subtitle = _pick_subtitle(out_dir)
+    subtitle = _pick_subtitle(out_dir, detected_lang)
     info = _read_info(out_dir / "video.info.json", url)
 
     return {
@@ -166,15 +220,19 @@ def download(
     source: str,
     out_dir: Path,
     audio_only: bool = False,
+    lang: str | None = None,
 ) -> dict:
     if is_url(source):
-        return download_url(source, out_dir, audio_only=audio_only)
+        return download_url(source, out_dir, audio_only=audio_only, lang=lang)
     return resolve_local(source)
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
     if len(sys.argv) < 3:
-        print("usage: download.py <url-or-path> <out-dir>", file=sys.stderr)
+        print("usage: download.py <url-or-path> <out-dir> [lang]", file=sys.stderr)
         raise SystemExit(2)
-    result = download(sys.argv[1], Path(sys.argv[2]))
+    forced_lang = sys.argv[3] if len(sys.argv) > 3 else None
+    result = download(sys.argv[1], Path(sys.argv[2]), lang=forced_lang)
     print(json.dumps(result, indent=2))
