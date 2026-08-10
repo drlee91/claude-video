@@ -34,6 +34,12 @@ from deepgram_backend import load_deepgram_key  # noqa: E402
 
 
 def main() -> int:
+    # Windows defaults stdout/stderr to the system codepage (e.g. cp1252) when
+    # not attached to a console, mangling non-ASCII transcript text (umlauts,
+    # accents) for anything that captures this script's output.
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
     ap = argparse.ArgumentParser(
         prog="watch",
         description="Download a video, extract auto-scaled frames, and surface the transcript.",
@@ -59,6 +65,12 @@ def main() -> int:
             "to OpenAI; Deepgram is used for audio over 25 MB or when it holds the only key."
         ),
     )
+    ap.add_argument(
+        "--lang",
+        type=str,
+        default=None,
+        help="Force subtitle language (e.g. 'de'). Default: auto-detect from video metadata.",
+    )
     args = ap.parse_args()
 
     max_frames = min(args.max_frames, 100)
@@ -74,7 +86,7 @@ def main() -> int:
         "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",
         file=sys.stderr,
     )
-    dl = download(args.source, work / "download")
+    dl = download(args.source, work / "download", lang=args.lang)
     video_path = dl["video_path"]
 
     meta = get_metadata(video_path)
