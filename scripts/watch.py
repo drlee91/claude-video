@@ -34,12 +34,6 @@ from deepgram_backend import load_deepgram_key  # noqa: E402
 
 
 def main() -> int:
-    # Windows defaults stdout/stderr to the system codepage (e.g. cp1252) when
-    # not attached to a console, mangling non-ASCII transcript text (umlauts,
-    # accents) for anything that captures this script's output.
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
-
     ap = argparse.ArgumentParser(
         prog="watch",
         description="Download a video, extract auto-scaled frames, and surface the transcript.",
